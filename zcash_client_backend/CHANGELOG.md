@@ -10,6 +10,28 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `zcash_client_backend::sync::run_step` and `zcash_client_backend::sync::StepOptions`,
+  a bounded variant of `sync::run` (behind the `sync` feature). Each call scans at
+  most `StepOptions::max_batches` batches and returns `Ok(true)` while work
+  remains, or `Ok(false)` once the wallet is up to date; every return point leaves
+  the wallet in a resumable state (unscanned ranges stay in the scan queue, and
+  cached blocks that were scanned have been deleted). This lets a caller that must
+  hold a wallet lock across a sync call, such as a wasm wallet persisting to
+  browser storage, release the lock, checkpoint, or stop between batches instead
+  of committing to a single multi-hour `run`. `sync::run` is now implemented in
+  terms of `run_step` and behaves as before.
+
+### Changed
+- `zcash_client_backend::data_api::testing::MockWalletDb` (behind the
+  `test-dependencies` feature) now uses the new
+  `zcash_client_backend::data_api::testing::MockWalletError` type as its
+  `InputSource`, `WalletRead` and `WalletWrite` error type instead of `()`, so
+  that it satisfies the `std::error::Error` bounds of `sync::run` and
+  `sync::run_step`. Its `suggest_scan_ranges` implementation now returns a
+  configurable queue of ranges from which `put_blocks` removes the heights it is
+  given; the queue is empty by default, so existing behaviour is unchanged.
+
 ### Fixed
 - `zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt`
   now records the transaction's Ironwood outputs in the stored `SentTransaction`.

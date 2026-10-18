@@ -6,8 +6,9 @@
 //! - Transactions are not enhanced once detected (that is, after an output is detected in
 //!   a transaction, the full transaction is not downloaded and scanned).
 //! - There is no mechanism for notifying the caller of progress updates.
-//! - There is no mechanism for interrupting the synchronization flow, other than ending
-//!   the process.
+//! - There is no mechanism for interrupting the synchronization flow from within [`run`],
+//!   other than ending the process. Callers that need to pause, persist, or stop between
+//!   batches can drive the same flow one bounded step at a time with [`run_step`].
 
 #[cfg(feature = "sync")]
 use {
@@ -25,7 +26,7 @@ use {
     },
     futures_util::TryStreamExt,
     shardtree::error::ShardTreeError,
-    std::fmt,
+    std::{fmt, future::Future},
     subtle::ConditionallySelectable,
     tonic::{
         body::Body as TonicBody,
@@ -81,11 +82,147 @@ where
     // 2) Pass the commitment tree data to the database.
     update_subtree_roots(client, db_data).await?;
 
-    while running(client, params, db_cache, db_data, batch_size).await? {}
+    let opts = StepOptions {
+        refresh_subtree_roots: false,
+        max_batches: usize::MAX,
+    };
+    while run_step(client, params, db_cache, db_data, batch_size, opts).await? {}
 
     Ok(())
 }
 
+/// Options for [`run_step`].
+#[cfg(feature = "sync")]
+#[derive(Clone, Copy, Debug)]
+pub struct StepOptions {
+    /// Refresh the subtree roots from the server before scanning. Needed on the first step of a
+    /// sync and after a long pause; skipping it on later steps saves a network round trip.
+    pub refresh_subtree_roots: bool,
+    /// Scan at most this many batches before returning. `usize::MAX` behaves like [`run`].
+    ///
+    /// A step that has work to do always scans at least one batch, so a value of `0` is
+    /// treated as `1`.
+    pub max_batches: usize,
+}
+
+/// Performs a bounded amount of sync work and reports whether more remains.
+///
+/// Equivalent to [`run`] when called repeatedly until it returns `Ok(false)`, but returns after
+/// at most `opts.max_batches` scanned batches so the caller can release locks, persist the
+/// wallet, or stop. Each return point leaves the wallet in a state a later call (or a later
+/// process) can resume from: ranges not yet scanned stay in the scan queue, and cached blocks
+/// already scanned have been deleted.
+///
+/// Every call refreshes the wallet's view of the chain tip (and, with the `transparent-inputs`
+/// feature, its UTXOs) before scanning, so a step that finds no work left returns `Ok(false)`
+/// without scanning anything.
+///
+/// Returns `Ok(true)` if the caller should call this function again, either because the batch
+/// budget was exhausted or because scanning changed the suggested scan ranges, and `Ok(false)`
+/// once the wallet reports no further ranges to scan.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run`]: a failure while talking to the server
+/// ([`Error::Server`], [`Error::MisbehavingServer`]), while reading or writing the block cache
+/// ([`Error::Cache`]), while scanning ([`Error::Scan`]), or while reading or writing the wallet
+/// ([`Error::Wallet`], [`Error::WalletTrees`]).
+#[cfg(feature = "sync")]
+pub async fn run_step<P, ChT, CaT, DbT>(
+    client: &mut CompactTxStreamerClient<ChT>,
+    params: &P,
+    db_cache: &CaT,
+    db_data: &mut DbT,
+    batch_size: u32,
+    opts: StepOptions,
+) -> Result<
+    bool,
+    Error<CaT::Error, <DbT as WalletRead>::Error, <DbT as WalletCommitmentTrees>::Error>,
+>
+where
+    P: Parameters + Send + 'static,
+    ChT: GrpcService<TonicBody>,
+    ChT::Error: Into<StdError>,
+    ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
+    CaT: BlockCache,
+    CaT::Error: std::error::Error + Send + Sync + 'static,
+    DbT: WalletWrite + WalletCommitmentTrees,
+    DbT::AccountId: ConditionallySelectable + Default + Send + Sync + 'static,
+    <DbT as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
+    <DbT as WalletCommitmentTrees>::Error: std::error::Error + Send + Sync + 'static,
+{
+    if opts.refresh_subtree_roots {
+        update_subtree_roots(client, db_data).await?;
+    }
+
+    running(
+        client,
+        params,
+        db_cache,
+        db_data,
+        batch_size,
+        BatchBudget::new(opts.max_batches),
+    )
+    .await
+}
+
+/// The number of batches a single call to [`running`] may still scan.
+#[cfg(feature = "sync")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchBudget {
+    remaining: usize,
+}
+
+/// Whether a [`BatchBudget`] permits scanning further batches.
+#[cfg(feature = "sync")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BudgetState {
+    /// At least one more batch may be scanned.
+    Remaining,
+    /// No further batches may be scanned in this step.
+    Exhausted,
+}
+
+#[cfg(feature = "sync")]
+impl BatchBudget {
+    /// Constructs a budget permitting at most `max_batches` batches, with a minimum of one so
+    /// that a step always makes progress when work remains.
+    fn new(max_batches: usize) -> Self {
+        Self {
+            remaining: max_batches.max(1),
+        }
+    }
+
+    /// Records that one batch has been scanned and reports whether the budget now permits
+    /// scanning another.
+    fn record_batch(&mut self) -> BudgetState {
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0 {
+            BudgetState::Exhausted
+        } else {
+            BudgetState::Remaining
+        }
+    }
+}
+
+/// Waits for the given cached-block deletions to complete.
+#[cfg(feature = "sync")]
+async fn await_block_deletions<CaErr, DbErr, TrErr>(
+    block_deletions: Vec<impl Future<Output = Result<(), CaErr>>>,
+) -> Result<(), Error<CaErr, DbErr, TrErr>> {
+    info!("Waiting for cached blocks to be deleted...");
+    for deletion in block_deletions {
+        deletion.await.map_err(Error::Cache)?;
+    }
+    Ok(())
+}
+
+/// Performs one step of the sync flow, scanning at most `budget` batches.
+///
+/// Returns `Ok(true)` if the caller should call this function again (either because the
+/// suggested scan ranges were updated or because the batch budget was exhausted), and
+/// `Ok(false)` once the wallet reports no further ranges to scan.
 #[cfg(feature = "sync")]
 async fn running<P, ChT, CaT, DbT, TrErr>(
     client: &mut CompactTxStreamerClient<ChT>,
@@ -93,6 +230,7 @@ async fn running<P, ChT, CaT, DbT, TrErr>(
     db_cache: &CaT,
     db_data: &mut DbT,
     batch_size: u32,
+    mut budget: BatchBudget,
 ) -> Result<bool, Error<CaT::Error, <DbT as WalletRead>::Error, TrErr>>
 where
     P: Parameters + Send + 'static,
@@ -156,6 +294,14 @@ where
                 // in CompactBlock files on disk is horrendous for the filesystem.
                 block_deletions.push(db_cache.delete(scan_range.clone()));
 
+                if budget.record_batch() == BudgetState::Exhausted {
+                    // The caller asked us to stop here. The verified range has been
+                    // scanned and removed from the scan queue, so the next step will
+                    // pick up whatever remains.
+                    await_block_deletions(block_deletions).await?;
+                    return Ok(true);
+                }
+
                 if scan_ranges_updated {
                     // The suggested scan ranges have been updated, so we re-request.
                     scan_ranges = db_data.suggest_scan_ranges().map_err(Error::Wallet)?;
@@ -207,21 +353,19 @@ where
         // Delete the now-scanned blocks.
         block_deletions.push(db_cache.delete(scan_range));
 
-        if scan_ranges_updated {
-            // The suggested scan ranges have been updated (either due to a continuity
-            // error or because a higher priority range has been added).
-            info!("Waiting for cached blocks to be deleted...");
-            for deletion in block_deletions {
-                deletion.await.map_err(Error::Cache)?;
-            }
+        let budget_exhausted = budget.record_batch() == BudgetState::Exhausted;
+
+        if scan_ranges_updated || budget_exhausted {
+            // Either the suggested scan ranges have been updated (due to a continuity
+            // error or because a higher priority range has been added), or the caller
+            // asked us to stop after this many batches. In both cases the ranges that
+            // remain are still in the scan queue, so the next step resumes from here.
+            await_block_deletions(block_deletions).await?;
             return Ok(true);
         }
     }
 
-    info!("Waiting for cached blocks to be deleted...");
-    for deletion in block_deletions {
-        deletion.await.map_err(Error::Cache)?;
-    }
+    await_block_deletions(block_deletions).await?;
     Ok(false)
 }
 
@@ -636,27 +780,44 @@ impl<CaErr, DbErr, TrErr> From<tonic::Status> for Error<CaErr, DbErr, TrErr> {
 #[cfg(all(test, feature = "sync", feature = "orchard"))]
 mod tests {
     use std::{
+        collections::BTreeMap,
         convert::Infallible,
-        future::{Ready, ready},
+        future::{Future, Ready, ready},
+        ops::Range,
+        pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
     };
 
+    use async_trait::async_trait;
     use tonic::{
+        Status,
         body::Body as TonicBody,
-        codegen::{Service, http::Request, http::Response},
+        codec::{BufferSettings, EncodeBody, SingleMessageCompressionOverride, Streaming},
+        codegen::{Service, http::Request, http::Response, tokio_stream},
     };
-    use zcash_protocol::consensus::Network;
+    use tonic_prost::{ProstDecoder, ProstEncoder};
+    use zcash_protocol::consensus::{BlockHeight, Network};
 
     use crate::{
-        data_api::testing::MockWalletDb,
-        proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
+        data_api::{
+            chain::{BlockCache, BlockSource, error::Error as ChainError},
+            scanning::{ScanPriority, ScanRange},
+            testing::MockWalletDb,
+        },
+        proto::{
+            compact_formats::{ChainMetadata, CompactBlock},
+            service::{
+                self, BlockId, BlockRange, TreeState,
+                compact_tx_streamer_client::CompactTxStreamerClient,
+            },
+        },
     };
 
-    use super::update_subtree_roots;
+    use super::{BatchBudget, BudgetState, StepOptions, run, run_step, update_subtree_roots};
 
     #[derive(Clone)]
     struct CountingGrpcService(Arc<AtomicUsize>);
@@ -694,5 +855,461 @@ mod tests {
         });
 
         assert_eq!(request_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn batch_budget_counts_down_to_exhaustion() {
+        let mut budget = BatchBudget::new(3);
+        assert_eq!(budget.record_batch(), BudgetState::Remaining);
+        assert_eq!(budget.record_batch(), BudgetState::Remaining);
+        assert_eq!(budget.record_batch(), BudgetState::Exhausted);
+        // Once exhausted, the budget stays exhausted.
+        assert_eq!(budget.record_batch(), BudgetState::Exhausted);
+    }
+
+    #[test]
+    fn batch_budget_always_permits_one_batch() {
+        // A zero budget is treated as a budget of one, so a step always makes progress.
+        assert_eq!(BatchBudget::new(0), BatchBudget::new(1));
+        assert_eq!(BatchBudget::new(0).record_batch(), BudgetState::Exhausted);
+    }
+
+    #[test]
+    fn batch_budget_unbounded_never_exhausts() {
+        let mut budget = BatchBudget::new(usize::MAX);
+        for _ in 0..1000 {
+            assert_eq!(budget.record_batch(), BudgetState::Remaining);
+        }
+    }
+
+    // --- Mock lightwalletd ----------------------------------------------------------------
+
+    /// A deterministic hash for the block at the given height, so that consecutive blocks
+    /// served by the mock server pass the scanner's `prev_hash` continuity check.
+    fn block_hash(height: u32) -> Vec<u8> {
+        let mut hash = vec![0x5a; 32];
+        hash[..4].copy_from_slice(&height.to_le_bytes());
+        hash
+    }
+
+    fn compact_block(height: u32) -> CompactBlock {
+        CompactBlock {
+            height: height.into(),
+            hash: block_hash(height),
+            prev_hash: block_hash(height - 1),
+            chain_metadata: Some(ChainMetadata::default()),
+            ..Default::default()
+        }
+    }
+
+    /// Encodes a server-side gRPC response body carrying the given messages followed by an
+    /// OK status in the trailers, exactly as a real server would.
+    fn grpc_response<M: prost::Message + Send + 'static>(messages: Vec<M>) -> Response<TonicBody> {
+        let body = EncodeBody::new_server(
+            ProstEncoder::<M>::new(BufferSettings::default()),
+            tokio_stream::iter(messages.into_iter().map(Ok::<_, Status>)),
+            None,
+            SingleMessageCompressionOverride::default(),
+            None,
+        );
+        Response::builder()
+            .header("content-type", "application/grpc")
+            .body(TonicBody::new(body))
+            .unwrap()
+    }
+
+    /// Decodes the single message of a unary gRPC request body.
+    async fn grpc_request<M: prost::Message + Default + Send + 'static>(body: TonicBody) -> M {
+        let mut stream = Streaming::<M>::new_request(
+            ProstDecoder::<M>::new(BufferSettings::default()),
+            body,
+            None,
+            None,
+        );
+        stream
+            .message()
+            .await
+            .expect("request body decodes")
+            .expect("request body contains a message")
+    }
+
+    /// A `CompactTxStreamer` serving an empty chain of blocks with deterministic hashes, up
+    /// to `tip_height`. It records the path of every request it receives.
+    #[derive(Clone)]
+    struct MockLightwalletd {
+        tip_height: u32,
+        request_paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockLightwalletd {
+        fn new(tip_height: u32) -> Self {
+            Self {
+                tip_height,
+                request_paths: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn requests_for(&self, method: &str) -> usize {
+            self.request_paths
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.ends_with(method))
+                .count()
+        }
+    }
+
+    impl Service<Request<TonicBody>> for MockLightwalletd {
+        type Response = Response<TonicBody>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<TonicBody>) -> Self::Future {
+            let (parts, body) = request.into_parts();
+            let path = parts.uri.path().to_string();
+            self.request_paths.lock().unwrap().push(path.clone());
+            let tip_height = self.tip_height;
+
+            Box::pin(async move {
+                let method = path.rsplit('/').next().unwrap_or_default();
+                let response = match method {
+                    "GetLatestBlock" => grpc_response(vec![BlockId {
+                        height: tip_height.into(),
+                        hash: block_hash(tip_height),
+                    }]),
+                    "GetBlockRange" => {
+                        let range: BlockRange = grpc_request(body).await;
+                        let start = range.start.expect("start is set").height as u32;
+                        let end = range.end.expect("end is set").height as u32;
+                        assert!(start <= end, "mock server only serves ascending ranges");
+                        assert!(end <= tip_height, "requested blocks beyond the chain tip");
+                        grpc_response((start..=end).map(compact_block).collect())
+                    }
+                    "GetTreeState" => {
+                        let block: BlockId = grpc_request(body).await;
+                        let height = block.height as u32;
+                        grpc_response(vec![TreeState {
+                            network: "test".into(),
+                            height: height.into(),
+                            hash: hex::encode(block_hash(height)),
+                            time: 0,
+                            sapling_tree: String::new(),
+                            orchard_tree: String::new(),
+                            ironwood_tree: String::new(),
+                        }])
+                    }
+                    "GetSubtreeRoots" => grpc_response(Vec::<service::SubtreeRoot>::new()),
+                    other => panic!("unexpected request to mock lightwalletd: {other}"),
+                };
+                Ok(response)
+            })
+        }
+    }
+
+    // --- In-memory block cache ------------------------------------------------------------
+
+    /// An in-memory [`BlockCache`] that records the block range of every `insert` call, which
+    /// corresponds one-to-one with the batches the sync flow downloads and scans.
+    #[derive(Default)]
+    struct MemBlockCache {
+        blocks: Mutex<BTreeMap<u32, CompactBlock>>,
+        inserted_ranges: Mutex<Vec<Range<u32>>>,
+    }
+
+    impl MemBlockCache {
+        fn inserted_ranges(&self) -> Vec<Range<u32>> {
+            self.inserted_ranges.lock().unwrap().clone()
+        }
+
+        fn cached_heights(&self) -> Vec<u32> {
+            self.blocks.lock().unwrap().keys().copied().collect()
+        }
+    }
+
+    impl BlockSource for MemBlockCache {
+        type Error = Infallible;
+
+        fn with_blocks<F, WalletErrT>(
+            &self,
+            from_height: Option<BlockHeight>,
+            limit: Option<usize>,
+            mut with_block: F,
+        ) -> Result<(), ChainError<WalletErrT, Self::Error>>
+        where
+            F: FnMut(CompactBlock) -> Result<(), ChainError<WalletErrT, Self::Error>>,
+        {
+            let blocks = self.blocks.lock().unwrap();
+            let from = from_height.map_or(0, u32::from);
+            let selected = blocks
+                .range(from..)
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|(_, b)| b.clone())
+                .collect::<Vec<_>>();
+            drop(blocks);
+            for block in selected {
+                with_block(block)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BlockCache for MemBlockCache {
+        fn get_tip_height(
+            &self,
+            range: Option<&ScanRange>,
+        ) -> Result<Option<BlockHeight>, Self::Error> {
+            let blocks = self.blocks.lock().unwrap();
+            Ok(blocks
+                .keys()
+                .filter(|h| range.is_none_or(|r| r.block_range().contains(&(**h).into())))
+                .max()
+                .map(|h| BlockHeight::from_u32(*h)))
+        }
+
+        async fn read(&self, range: &ScanRange) -> Result<Vec<CompactBlock>, Self::Error> {
+            let start = u32::from(range.block_range().start);
+            let end = u32::from(range.block_range().end);
+            Ok(self
+                .blocks
+                .lock()
+                .unwrap()
+                .range(start..end)
+                .map(|(_, b)| b.clone())
+                .collect())
+        }
+
+        async fn insert(&self, compact_blocks: Vec<CompactBlock>) -> Result<(), Self::Error> {
+            let heights = compact_blocks.iter().map(|b| b.height as u32);
+            if let Some((min, max)) = heights.clone().min().zip(heights.max()) {
+                self.inserted_ranges.lock().unwrap().push(min..max + 1);
+            }
+            let mut blocks = self.blocks.lock().unwrap();
+            for block in compact_blocks {
+                blocks.insert(block.height as u32, block);
+            }
+            Ok(())
+        }
+
+        async fn delete(&self, range: ScanRange) -> Result<(), Self::Error> {
+            let start = u32::from(range.block_range().start);
+            let end = u32::from(range.block_range().end);
+            self.blocks
+                .lock()
+                .unwrap()
+                .retain(|h, _| !(start..end).contains(h));
+            Ok(())
+        }
+    }
+
+    // --- run_step tests -------------------------------------------------------------------
+
+    const BATCH_SIZE: u32 = 10;
+    const TIP_HEIGHT: u32 = 1050;
+
+    fn scan_range(range: Range<u32>, priority: ScanPriority) -> ScanRange {
+        ScanRange::from_parts(
+            BlockHeight::from_u32(range.start)..BlockHeight::from_u32(range.end),
+            priority,
+        )
+    }
+
+    /// The scan queue every test starts from: a `Verify` range (handled by the verification
+    /// loop, which downloads the whole range as one batch) followed by a `Historic` range that
+    /// the main loop splits into `BATCH_SIZE` batches, the last of which is short.
+    fn initial_scan_queue() -> Vec<ScanRange> {
+        vec![
+            scan_range(1030..1045, ScanPriority::Verify),
+            scan_range(1000..1025, ScanPriority::Historic),
+        ]
+    }
+
+    /// The batches `run` is expected to download and scan for `initial_scan_queue`.
+    fn expected_batches() -> Vec<Range<u32>> {
+        vec![1030..1045, 1000..1010, 1010..1020, 1020..1025]
+    }
+
+    struct Harness {
+        server: MockLightwalletd,
+        client: CompactTxStreamerClient<MockLightwalletd>,
+        cache: MemBlockCache,
+        wallet: MockWalletDb,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let server = MockLightwalletd::new(TIP_HEIGHT);
+            let client = CompactTxStreamerClient::new(server.clone());
+            let mut wallet = MockWalletDb::new(Network::TestNetwork);
+            wallet.set_scan_queue(initial_scan_queue());
+            Self {
+                server,
+                client,
+                cache: MemBlockCache::default(),
+                wallet,
+            }
+        }
+
+        async fn run(&mut self) {
+            run(
+                &mut self.client,
+                &Network::TestNetwork,
+                &self.cache,
+                &mut self.wallet,
+                BATCH_SIZE,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn run_step(&mut self, opts: StepOptions) -> bool {
+            run_step(
+                &mut self.client,
+                &Network::TestNetwork,
+                &self.cache,
+                &mut self.wallet,
+                BATCH_SIZE,
+                opts,
+            )
+            .await
+            .unwrap()
+        }
+
+        fn remaining_ranges(&self) -> Vec<ScanRange> {
+            self.wallet.suggest_scan_ranges().unwrap()
+        }
+    }
+
+    use crate::data_api::WalletRead as _;
+
+    #[test]
+    fn run_scans_all_batches_and_clears_cache() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut h = Harness::new();
+            h.run().await;
+
+            assert_eq!(h.cache.inserted_ranges(), expected_batches());
+            assert!(h.remaining_ranges().is_empty());
+            assert!(h.cache.cached_heights().is_empty());
+            assert_eq!(h.server.requests_for("GetSubtreeRoots"), 3);
+        });
+    }
+
+    #[test]
+    fn run_step_single_batch_matches_run() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut h = Harness::new();
+            let first = StepOptions {
+                refresh_subtree_roots: true,
+                max_batches: 1,
+            };
+            let later = StepOptions {
+                refresh_subtree_roots: false,
+                max_batches: 1,
+            };
+
+            // The first step refreshes the subtree roots (one request per pool) and scans
+            // exactly one batch: the Verify range, as a single batch.
+            assert!(h.run_step(first).await);
+            assert_eq!(h.server.requests_for("GetSubtreeRoots"), 3);
+            assert_eq!(h.cache.inserted_ranges(), vec![1030..1045]);
+            assert_eq!(
+                h.remaining_ranges(),
+                vec![scan_range(1000..1025, ScanPriority::Historic)]
+            );
+            // Scanned blocks have been deleted before the step returned.
+            assert!(h.cache.cached_heights().is_empty());
+
+            // Each further step scans one batch and leaves the remainder queued.
+            assert!(h.run_step(later).await);
+            assert_eq!(
+                h.remaining_ranges(),
+                vec![scan_range(1010..1025, ScanPriority::Historic)]
+            );
+            assert!(h.cache.cached_heights().is_empty());
+
+            assert!(h.run_step(later).await);
+            assert_eq!(
+                h.remaining_ranges(),
+                vec![scan_range(1020..1025, ScanPriority::Historic)]
+            );
+
+            // The final batch exhausts the budget, so the step still reports more work; the
+            // next step finds nothing to do and reports completion without scanning.
+            assert!(h.run_step(later).await);
+            assert!(h.remaining_ranges().is_empty());
+            assert!(!h.run_step(later).await);
+
+            assert_eq!(h.cache.inserted_ranges(), expected_batches());
+            assert!(h.cache.cached_heights().is_empty());
+            // Only the first step refreshed the subtree roots.
+            assert_eq!(h.server.requests_for("GetSubtreeRoots"), 3);
+            // Each step refreshed the chain tip.
+            assert_eq!(h.server.requests_for("GetLatestBlock"), 5);
+        });
+    }
+
+    #[test]
+    fn run_step_reports_completion_when_queue_drains_within_budget() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut h = Harness::new();
+            let opts = StepOptions {
+                refresh_subtree_roots: false,
+                max_batches: 3,
+            };
+
+            // Four batches in total: the first step scans three, the second scans the last
+            // one and then observes an empty queue, so it reports completion directly.
+            assert!(h.run_step(opts).await);
+            assert_eq!(
+                h.cache.inserted_ranges(),
+                vec![1030..1045, 1000..1010, 1010..1020]
+            );
+            assert_eq!(
+                h.remaining_ranges(),
+                vec![scan_range(1020..1025, ScanPriority::Historic)]
+            );
+
+            assert!(!h.run_step(opts).await);
+            assert_eq!(h.cache.inserted_ranges(), expected_batches());
+            assert!(h.remaining_ranges().is_empty());
+            assert!(h.cache.cached_heights().is_empty());
+        });
+    }
+
+    #[test]
+    fn run_step_unbounded_behaves_like_run() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut h = Harness::new();
+            let opts = StepOptions {
+                refresh_subtree_roots: true,
+                max_batches: usize::MAX,
+            };
+
+            assert!(!h.run_step(opts).await);
+            assert_eq!(h.cache.inserted_ranges(), expected_batches());
+            assert!(h.remaining_ranges().is_empty());
+            assert!(h.cache.cached_heights().is_empty());
+        });
+    }
+
+    #[test]
+    fn run_step_with_nothing_to_do_reports_completion() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut h = Harness::new();
+            h.wallet.set_scan_queue(vec![]);
+            let opts = StepOptions {
+                refresh_subtree_roots: false,
+                max_batches: 1,
+            };
+
+            assert!(!h.run_step(opts).await);
+            assert!(h.cache.inserted_ranges().is_empty());
+            assert_eq!(h.server.requests_for("GetLatestBlock"), 1);
+        });
     }
 }

@@ -2935,6 +2935,18 @@ impl NoteCommitments {
     }
 }
 
+/// The error returned by [`MockWalletDb`] from operations it does not support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MockWalletError;
+
+impl fmt::Display for MockWalletError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "operation not supported by MockWalletDb")
+    }
+}
+
+impl std::error::Error for MockWalletError {}
+
 /// A mock wallet data source that implements the bare minimum necessary to function.
 pub struct MockWalletDb {
     pub network: Network,
@@ -2952,6 +2964,9 @@ pub struct MockWalletDb {
     account_ids: Vec<u32>,
     addresses_by_account: HashMap<u32, Vec<AddressInfo>>,
     ufvks_by_account: HashMap<u32, UnifiedFullViewingKey>,
+    /// Ranges returned by [`WalletRead::suggest_scan_ranges`], in order. Heights covered by
+    /// blocks passed to [`WalletWrite::put_blocks`] are removed from these ranges.
+    scan_queue: Vec<ScanRange>,
 }
 
 impl MockWalletDb {
@@ -2965,7 +2980,18 @@ impl MockWalletDb {
             account_ids: vec![],
             addresses_by_account: HashMap::new(),
             ufvks_by_account: HashMap::new(),
+            scan_queue: vec![],
         }
+    }
+
+    /// Replaces the ranges that [`WalletRead::suggest_scan_ranges`] will return.
+    ///
+    /// The ranges are returned in the order given; the mock does not reorder them by
+    /// priority. Scanning blocks via [`WalletWrite::put_blocks`] removes the scanned heights
+    /// from the queue.
+    #[cfg(test)]
+    pub(crate) fn set_scan_queue(&mut self, ranges: Vec<ScanRange>) {
+        self.scan_queue = ranges;
     }
 
     #[cfg(test)]
@@ -2998,7 +3024,7 @@ impl MockWalletDb {
 }
 
 impl InputSource for MockWalletDb {
-    type Error = ();
+    type Error = MockWalletError;
     type NoteRef = u32;
     type AccountId = u32;
 
@@ -3031,7 +3057,7 @@ impl InputSource for MockWalletDb {
         _target_height: TargetHeight,
         _exclude: &[Self::NoteRef],
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 
     fn get_account_metadata(
@@ -3041,12 +3067,12 @@ impl InputSource for MockWalletDb {
         _target_height: TargetHeight,
         _exclude: &[Self::NoteRef],
     ) -> Result<AccountMeta, Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 }
 
 impl WalletRead for MockWalletDb {
-    type Error = ();
+    type Error = MockWalletError;
     type AccountId = u32;
     type Account = (Self::AccountId, UnifiedFullViewingKey, BlockHeight);
 
@@ -3120,7 +3146,7 @@ impl WalletRead for MockWalletDb {
     }
 
     fn get_account_birthday(&self, _account: Self::AccountId) -> Result<BlockHeight, Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 
     fn get_wallet_birthday(&self) -> Result<Option<BlockHeight>, Self::Error> {
@@ -3159,7 +3185,7 @@ impl WalletRead for MockWalletDb {
     }
 
     fn suggest_scan_ranges(&self) -> Result<Vec<ScanRange>, Self::Error> {
-        Ok(vec![])
+        Ok(self.scan_queue.clone())
     }
 
     fn get_target_and_anchor_heights(
@@ -3271,7 +3297,7 @@ impl WalletWrite for MockWalletDb {
         let account = zip32::AccountId::ZERO;
         UnifiedSpendingKey::from_seed(&self.network, seed.expose_secret(), account)
             .map(|k| (u32::from(account), k))
-            .map_err(|_| ())
+            .map_err(|_| MockWalletError)
     }
 
     fn import_account_hd(
@@ -3339,8 +3365,24 @@ impl WalletWrite for MockWalletDb {
     fn put_blocks(
         &mut self,
         _from_state: &ChainState,
-        _blocks: Vec<ScannedBlock<Self::AccountId>>,
+        blocks: Vec<ScannedBlock<Self::AccountId>>,
     ) -> Result<(), Self::Error> {
+        // Remove the scanned heights from the scan queue, splitting any range that the
+        // scanned blocks fall strictly inside of.
+        let scanned = blocks
+            .iter()
+            .map(|b| b.height())
+            .min()
+            .zip(blocks.iter().map(|b| b.height()).max());
+        if let Some((start, end)) = scanned {
+            let end = end + 1;
+            let mut remaining = Vec::with_capacity(self.scan_queue.len() + 1);
+            for range in &self.scan_queue {
+                remaining.extend(range.truncate_end(start));
+                remaining.extend(range.truncate_start(end));
+            }
+            self.scan_queue = remaining;
+        }
         Ok(())
     }
 
@@ -3370,11 +3412,11 @@ impl WalletWrite for MockWalletDb {
         &mut self,
         _block_height: BlockHeight,
     ) -> Result<BlockHeight, Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 
     fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 
     fn rewind_to_chain_state(
@@ -3382,7 +3424,7 @@ impl WalletWrite for MockWalletDb {
         _chain_state: ChainState,
         _reset_account_birthdays: HashSet<Self::AccountId>,
     ) -> Result<(), RewindError<Self::AccountId, Self::Error>> {
-        Err(RewindError::DataSource(()))
+        Err(RewindError::DataSource(MockWalletError))
     }
 
     /// Adds a transparent UTXO received by the wallet to the data store.
@@ -3399,7 +3441,7 @@ impl WalletWrite for MockWalletDb {
         _account_id: Self::AccountId,
         _n: usize,
     ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 
     #[cfg(feature = "transparent-inputs")]
@@ -3408,7 +3450,7 @@ impl WalletWrite for MockWalletDb {
         _account_id: Self::AccountId,
         _n: usize,
     ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
-        Err(())
+        Err(MockWalletError)
     }
 
     fn set_transaction_status(

@@ -31,7 +31,7 @@
 //! #   test();
 //! # }
 //! #
-//! # fn test() -> Result<(), Error<(), Infallible>> {
+//! # fn test() -> Result<(), Error<testing::MockWalletError, Infallible>> {
 //! let network = Network::TestNetwork;
 //! let block_source = chain_testing::MockBlockSource;
 //! let mut wallet_db = testing::MockWalletDb::new(Network::TestNetwork);
