@@ -19,8 +19,10 @@ workspace.
   cached blocks that were scanned have been deleted). This lets a caller that must
   hold a wallet lock across a sync call, such as a wasm wallet persisting to
   browser storage, release the lock, checkpoint, or stop between batches instead
-  of committing to a single multi-hour `run`. `sync::run` is now implemented in
-  terms of `run_step` and behaves as before.
+  of committing to a single multi-hour `run`. Verifying the wallet's view of the
+  chain tip runs to completion at the start of every step and does not count
+  against the budget, so a step always makes progress on the unscanned ranges.
+  `sync::run` is now implemented in terms of `run_step` and behaves as before.
 
 ### Changed
 - `zcash_client_backend::data_api::testing::MockWalletDb` (behind the

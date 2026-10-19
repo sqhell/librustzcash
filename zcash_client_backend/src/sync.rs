@@ -100,6 +100,11 @@ pub struct StepOptions {
     pub refresh_subtree_roots: bool,
     /// Scan at most this many batches before returning. `usize::MAX` behaves like [`run`].
     ///
+    /// The budget applies to the batches of the main scanning loop. Verifying the wallet's
+    /// view of the chain tip (the `Verify` ranges that [`WalletWrite::update_chain_tip`]
+    /// creates) always runs to completion first and is not counted, so every step that has
+    /// unscanned ranges makes progress on them.
+    ///
     /// A step that has work to do always scans at least one batch, so a value of `0` is
     /// treated as `1`.
     pub max_batches: usize,
@@ -114,8 +119,11 @@ pub struct StepOptions {
 /// already scanned have been deleted.
 ///
 /// Every call refreshes the wallet's view of the chain tip (and, with the `transparent-inputs`
-/// feature, its UTXOs) before scanning, so a step that finds no work left returns `Ok(false)`
-/// without scanning anything.
+/// feature, its UTXOs) and then scans any `Verify` ranges to completion before the budgeted
+/// batches, so a step that finds no work left returns `Ok(false)` without scanning anything.
+/// Mid-sync the chain tip refresh marks a short lookahead above the max scanned height as
+/// `Verify` on every call; those blocks are scanned in addition to, never instead of, the
+/// `opts.max_batches` batches.
 ///
 /// Returns `Ok(true)` if the caller should call this function again, either because the batch
 /// budget was exhausted or because scanning changed the suggested scan ranges, and `Ok(false)`
@@ -294,13 +302,13 @@ where
                 // in CompactBlock files on disk is horrendous for the filesystem.
                 block_deletions.push(db_cache.delete(scan_range.clone()));
 
-                if budget.record_batch() == BudgetState::Exhausted {
-                    // The caller asked us to stop here. The verified range has been
-                    // scanned and removed from the scan queue, so the next step will
-                    // pick up whatever remains.
-                    await_block_deletions(block_deletions).await?;
-                    return Ok(true);
-                }
+                // Verification is the preamble of every step, not part of its batch
+                // budget. `update_chain_tip` marks the `VERIFY_LOOKAHEAD` blocks above
+                // the max scanned height as `Verify` whenever that height is below the
+                // stable region, which is the case for the whole of a long sync. If a
+                // verified range consumed the budget, a step with a budget of one batch
+                // would verify those few blocks, return, and verify the next few on the
+                // following step, never reaching the main loop below.
 
                 if scan_ranges_updated {
                     // The suggested scan ranges have been updated, so we re-request.
@@ -1212,14 +1220,14 @@ mod tests {
                 max_batches: 1,
             };
 
-            // The first step refreshes the subtree roots (one request per pool) and scans
-            // exactly one batch: the Verify range, as a single batch.
+            // The first step refreshes the subtree roots (one request per pool), verifies the
+            // Verify range (not counted against the budget) and scans exactly one batch.
             assert!(h.run_step(first).await);
             assert_eq!(h.server.requests_for("GetSubtreeRoots"), 3);
-            assert_eq!(h.cache.inserted_ranges(), vec![1030..1045]);
+            assert_eq!(h.cache.inserted_ranges(), vec![1030..1045, 1000..1010]);
             assert_eq!(
                 h.remaining_ranges(),
-                vec![scan_range(1000..1025, ScanPriority::Historic)]
+                vec![scan_range(1010..1025, ScanPriority::Historic)]
             );
             // Scanned blocks have been deleted before the step returned.
             assert!(h.cache.cached_heights().is_empty());
@@ -1228,15 +1236,9 @@ mod tests {
             assert!(h.run_step(later).await);
             assert_eq!(
                 h.remaining_ranges(),
-                vec![scan_range(1010..1025, ScanPriority::Historic)]
-            );
-            assert!(h.cache.cached_heights().is_empty());
-
-            assert!(h.run_step(later).await);
-            assert_eq!(
-                h.remaining_ranges(),
                 vec![scan_range(1020..1025, ScanPriority::Historic)]
             );
+            assert!(h.cache.cached_heights().is_empty());
 
             // The final batch exhausts the budget, so the step still reports more work; the
             // next step finds nothing to do and reports completion without scanning.
@@ -1249,7 +1251,7 @@ mod tests {
             // Only the first step refreshed the subtree roots.
             assert_eq!(h.server.requests_for("GetSubtreeRoots"), 3);
             // Each step refreshed the chain tip.
-            assert_eq!(h.server.requests_for("GetLatestBlock"), 5);
+            assert_eq!(h.server.requests_for("GetLatestBlock"), 4);
         });
     }
 
@@ -1262,22 +1264,60 @@ mod tests {
                 max_batches: 3,
             };
 
-            // Four batches in total: the first step scans three, the second scans the last
-            // one and then observes an empty queue, so it reports completion directly.
+            // The Verify range is not budgeted, and the three Historic batches fit the budget
+            // exactly, so the first step scans everything but still reports more work (the
+            // budget was exhausted by the last batch). The second step observes an empty
+            // queue and reports completion without scanning.
             assert!(h.run_step(opts).await);
-            assert_eq!(
-                h.cache.inserted_ranges(),
-                vec![1030..1045, 1000..1010, 1010..1020]
-            );
-            assert_eq!(
-                h.remaining_ranges(),
-                vec![scan_range(1020..1025, ScanPriority::Historic)]
-            );
+            assert_eq!(h.cache.inserted_ranges(), expected_batches());
+            assert!(h.remaining_ranges().is_empty());
 
             assert!(!h.run_step(opts).await);
             assert_eq!(h.cache.inserted_ranges(), expected_batches());
             assert!(h.remaining_ranges().is_empty());
             assert!(h.cache.cached_heights().is_empty());
+        });
+    }
+
+    /// Mid-sync, `update_chain_tip` marks the lookahead above the max scanned height as
+    /// `Verify` on every call. `MockWalletDb::update_chain_tip` is a no-op, so the test
+    /// re-creates that range by hand before each step. Each step with a budget of one batch
+    /// must still scan one `Historic` batch; otherwise a sync driven by single-batch steps
+    /// would advance only by the lookahead per step.
+    #[test]
+    fn run_step_verification_never_starves_the_batch_budget() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut h = Harness::new();
+            let opts = StepOptions {
+                refresh_subtree_roots: false,
+                max_batches: 1,
+            };
+            let mut expected = vec![];
+
+            for verify in [1030..1045, 1045..1048, 1048..1050] {
+                let mut queue = vec![scan_range(verify.clone(), ScanPriority::Verify)];
+                queue.extend(
+                    h.remaining_ranges()
+                        .into_iter()
+                        .filter(|r| r.priority() != ScanPriority::Verify),
+                );
+                let historic = queue
+                    .iter()
+                    .find(|r| r.priority() == ScanPriority::Historic)
+                    .map(|r| r.block_range().clone())
+                    .expect("historic work remains");
+                h.wallet.set_scan_queue(queue);
+
+                assert!(h.run_step(opts).await);
+
+                let batch_end = std::cmp::min(historic.start + BATCH_SIZE, historic.end);
+                expected.push(verify);
+                expected.push(u32::from(historic.start)..u32::from(batch_end));
+                assert_eq!(h.cache.inserted_ranges(), expected);
+                assert!(h.cache.cached_heights().is_empty());
+            }
+
+            assert!(h.remaining_ranges().is_empty());
         });
     }
 
